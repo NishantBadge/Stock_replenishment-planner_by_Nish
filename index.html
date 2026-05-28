@@ -1,0 +1,569 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Smart Replenishment Planner</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📦</text></svg>">
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.9/babel.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+  <style>
+    *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+    body{font-family:'DM Sans','Segoe UI',system-ui,sans-serif;background:#0c0e16;color:#d4dae6;min-height:100vh;-webkit-font-smoothing:antialiased}
+    ::-webkit-scrollbar{width:6px;height:6px}::-webkit-scrollbar-track{background:#0c0e16}::-webkit-scrollbar-thumb{background:#2d3348;border-radius:3px}::-webkit-scrollbar-thumb:hover{background:#3f4760}
+    input[type="file"]{display:none}input[type="checkbox"]{accent-color:#3b82f6}::placeholder{color:#3f4760}select,input[type="text"],input[type="number"]{outline:none}select:focus,input:focus{border-color:#3b82f6!important}
+    table{border-spacing:0}#root{min-height:100vh}
+    @media(max-width:768px){.stats-grid{grid-template-columns:repeat(2,1fr)!important}.upload-grid{grid-template-columns:1fr!important}.top-bar{flex-direction:column;gap:8px!important;align-items:flex-start!important}}
+  </style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const {useState,useMemo,useCallback} = React;
+
+function norm(code){
+  if(!code)return "";
+  let s=String(code).trim();
+  if(/[eE]\+/.test(s))try{s=BigInt(Math.round(Number(s))).toString()}catch(e){}
+  return s.replace(/\.0+$/,"");
+}
+function findF(row,keys){for(const k of keys){const v=row[k];if(v!==undefined&&v!==null&&v!=="")return v}return null}
+function num(v){if(v==null||v==="")return 0;const n=Number(v);return isNaN(n)?0:n}
+
+function parseSpec(spec){
+  if(!spec)return 1;
+  const s=String(spec).trim();
+  const m=s.match(/(\d+)\s*\*\s*(\d+)/);
+  if(m)return parseInt(m[2],10)||1;
+  const n=parseInt(s,10);
+  return n>0?n:1;
+}
+
+function getPackSize(wh){
+  const minOrder=String(wh.minOrderSpec||"").trim().toLowerCase();
+  if(minOrder.includes("single"))return 1;
+  return parseSpec(wh.Specification||wh.specification);
+}
+
+function fmtMonth(dateStr){
+  var months=["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+  var v=dateStr;
+  var d;
+  // Handle Excel serial date numbers (e.g. 45992 = Nov 2025)
+  if(typeof v==="number"||(typeof v==="string"&&/^\d+(\.\d+)?$/.test(String(v).trim()))){
+    var serial=Number(v);
+    if(serial>30000&&serial<60000){
+      d=new Date((serial-25569)*86400000);
+      if(!isNaN(d.getTime()))return months[d.getUTCMonth()]+"-"+String(d.getUTCFullYear()).slice(2);
+    }
+  }
+  // Handle date strings like "2025-11-01 00:00:00" or Date objects
+  try{
+    d=new Date(String(v));
+    if(!isNaN(d.getTime()))return months[d.getMonth()]+"-"+String(d.getFullYear()).slice(2);
+  }catch(e){}
+  return String(dateStr).slice(0,7);
+}
+
+function buildReason(storeStock,avgDaily,sale30,sale90,stockHealth,daysLeft,qtyToBuy,targetDays,packSize,packsToOrder,adjustedQty,isSingle){
+  const h=String(stockHealth||"").toLowerCase();
+  if(h.includes("dead stock"))return "Dead Stock \u2014 no sales, skip ordering";
+  if(avgDaily<=0&&sale90<=0&&sale30<=0)return "No sales in 90 days \u2014 not recommended";
+  if(avgDaily<=0&&sale30>0)return "Recent sales only ("+sale30+" in 30D) \u2014 monitor";
+  if(qtyToBuy<=0)return "Adequate \u2014 "+daysLeft+" days cover (target: "+targetDays+"D)";
+  var packNote="";
+  if(!isSingle&&packSize>1)packNote=" \u2192 "+packsToOrder+" pk"+(packsToOrder>1?"s":"")+" of "+packSize+" = "+adjustedQty+" pcs";
+  else if(isSingle)packNote=" (single pcs)";
+  if(daysLeft<=3)return "Critical \u2014 "+daysLeft+"d left, "+avgDaily+"/day, need "+qtyToBuy+packNote;
+  if(daysLeft<=7)return "Low \u2014 "+daysLeft+"d left, "+avgDaily+"/day, need "+qtyToBuy+packNote;
+  if(daysLeft<=15)return "Moderate \u2014 "+daysLeft+"d left, "+avgDaily+"/day, need "+qtyToBuy+packNote;
+  return "Replenish \u2014 "+daysLeft+"d cover, need "+qtyToBuy+" for "+targetDays+"D"+packNote;
+}
+
+function App(){
+  const [whData,setWhData]=useState(null);
+  const [shData,setShData]=useState(null);
+  const [salesData,setSalesData]=useState(null);
+  const [whName,setWhName]=useState("");
+  const [shName,setShName]=useState("");
+  const [salesName,setSalesName]=useState("");
+  const [targetDays,setTargetDays]=useState(30);
+  const [search,setSearch]=useState("");
+  const [onlyOrder,setOnlyOrder]=useState(false);
+  const [onlyRanked,setOnlyRanked]=useState(false);
+  const [step,setStep]=useState(1);
+  const [err,setErr]=useState("");
+  const [whCols,setWhCols]=useState([]);
+
+  const load=useCallback(function(file,type){
+    const reader=new FileReader();
+    reader.onload=function(e){
+      try{
+        const wb=XLSX.read(e.target.result,{type:"array"});
+        const data=XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]],{defval:""});
+        if(type==="wh"){setWhData(data);setWhName(file.name);if(data.length>0)setWhCols(Object.keys(data[0]))}
+        else if(type==="sh"){setShData(data);setShName(file.name)}
+        else{setSalesData(data);setSalesName(file.name)}
+        setErr("");
+      }catch(ex){setErr("Error reading "+file.name+": "+ex.message)}
+    };
+    reader.readAsArrayBuffer(file);
+  },[]);
+
+  // Process monthly sales data
+  const salesInfo=useMemo(function(){
+    if(!salesData)return null;
+    // Get unique months sorted, take last 6
+    var monthSet=new Set();
+    salesData.forEach(function(r){monthSet.add(String(r["Month-Year"]||""))});
+    var allMonths=Array.from(monthSet).sort();
+    var last6=allMonths.slice(-6);
+
+    // Build per-SKU monthly qty map and totals
+    var skuMap={};
+    salesData.forEach(function(r){
+      var mo=String(r["Month-Year"]||"");
+      if(last6.indexOf(mo)===-1)return;
+      var code=norm(r["Product Code"]||r.ProductCode||r.skuCode||"");
+      if(!code)return;
+      if(!skuMap[code])skuMap[code]={total:0,months:{}};
+      var qty=num(r.Qty||r.qty||r.QTY||0);
+      skuMap[code].total+=qty;
+      skuMap[code].months[mo]=(skuMap[code].months[mo]||0)+qty;
+    });
+
+    // Build ranking (top 500)
+    var ranked=Object.keys(skuMap).map(function(code){return{code:code,total:skuMap[code].total}});
+    ranked.sort(function(a,b){return b.total-a.total});
+    var rankMap={};
+    for(var i=0;i<Math.min(500,ranked.length);i++){rankMap[ranked[i].code]=i+1}
+
+    // Format month labels
+    var monthLabels=last6.map(function(m){return fmtMonth(m)});
+
+    return{skuMap:skuMap,rankMap:rankMap,months:last6,monthLabels:monthLabels};
+  },[salesData]);
+
+  const results=useMemo(function(){
+    if(!whData||!shData)return null;
+    var shMap=new Map();
+    shData.forEach(function(r){
+      var c=norm(findF(r,["Product Code","ProductCode","product_code","SKU Code","skuCode"]));
+      if(c)shMap.set(c,r);
+    });
+    var matchCount=0,noMatchCount=0;
+    var rows=whData.map(function(wh){
+      var code=norm(wh.skuCode||wh.SKUCode||wh["SKU Code"]||"");
+      var sh=shMap.get(code);
+      var isSingle=String(wh.minOrderSpec||"").trim().toLowerCase().includes("single");
+      var packSize=getPackSize(wh);
+      var storeStock="",stockHealth="",sale30="",sale90="",avgDaily=0;
+      var daysLeft="",qtyToBuy=0,packsToOrder=0,adjustedQty=0,reason="";
+
+      // Monthly sales
+      var monthlySales={};
+      var totalSale6m=0;
+      var rank="";
+      if(salesInfo){
+        var sd=salesInfo.skuMap[code];
+        if(sd){
+          totalSale6m=sd.total;
+          salesInfo.months.forEach(function(m){monthlySales[m]=sd.months[m]||0});
+        }else{
+          salesInfo.months.forEach(function(m){monthlySales[m]=0});
+        }
+        rank=salesInfo.rankMap[code]||"";
+      }
+
+      if(sh){
+        matchCount++;
+        storeStock=num(findF(sh,["Sum of Total Stock","Total Stock","TotalStock"]));
+        stockHealth=String(findF(sh,["v4 Stock Health","Stock Health"])||"");
+        sale30=num(findF(sh,["v4 Sale Qty 30D","Sale Qty 30D"]));
+        sale90=num(findF(sh,["v4 Sale Qty 90D","Sale Qty 90D"]));
+        avgDaily=num(findF(sh,["v4 Avg Daily Sales 90D","Avg Daily Sales 90D","Avg Daily Sales"]));
+        daysLeft=avgDaily>0?Math.round(storeStock/avgDaily):(storeStock>0?"No Sales":0);
+        var isTop500=rank!==""&&rank<=500;
+        var useDays=isTop500?90:targetDays;
+        var required=Math.ceil(avgDaily*useDays);
+        qtyToBuy=Math.max(0,required-storeStock);
+        var limit=num(wh.orderNumLimit||99999);
+        qtyToBuy=Math.min(qtyToBuy,limit);
+        if(isSingle){
+          packsToOrder=qtyToBuy;
+          adjustedQty=qtyToBuy;
+        }else{
+          packsToOrder=qtyToBuy>0?Math.ceil(qtyToBuy/packSize):0;
+          adjustedQty=packsToOrder*packSize;
+        }
+        reason=buildReason(storeStock,avgDaily,sale30,sale90,stockHealth,typeof daysLeft==="number"?daysLeft:999,qtyToBuy,useDays,packSize,packsToOrder,adjustedQty,isSingle);
+      }else{
+        noMatchCount++;
+        reason="Not found in store stock data";
+      }
+
+      var result={};
+      Object.keys(wh).forEach(function(k){result[k]=wh[k]});
+      result._matched=!!sh;
+      result._storeStock=storeStock;
+      result._stockHealth=stockHealth;
+      result._sale30D=sale30;
+      result._sale90D=sale90;
+      result._avgDailySales=avgDaily;
+      result._daysOfCoverLeft=daysLeft;
+      result._targetDaysUsed=(rank!==""&&rank<=500)?90:targetDays;
+      result._qtyToBuy=qtyToBuy;
+      result._packSize=packSize;
+      result._isSingle=isSingle;
+      result._packsToOrder=packsToOrder;
+      result._adjustedOrderQty=adjustedQty;
+      result._adjustedOrderValue=Math.round(adjustedQty*num(wh.orderPrice));
+      result._monthlySales=monthlySales;
+      result._totalSale6m=totalSale6m;
+      result._rank=rank;
+      result._reason=reason;
+      return result;
+    });
+    return{rows:rows,matchCount:matchCount,noMatchCount:noMatchCount};
+  },[whData,shData,targetDays,salesInfo]);
+
+  const filtered=useMemo(function(){
+    if(!results)return[];
+    var list=results.rows.slice();
+    if(onlyOrder)list=list.filter(function(r){return r._qtyToBuy>0});
+    if(onlyRanked)list=list.filter(function(r){return r._rank!==""&&r._rank<=500});
+    if(search){
+      var q=search.toLowerCase();
+      list=list.filter(function(r){return(r.skuName||"").toLowerCase().includes(q)||(r.skuCode||"").includes(q)||(r._stockHealth||"").toLowerCase().includes(q)});
+    }
+    return list;
+  },[results,onlyOrder,onlyRanked,search]);
+
+  const stats=useMemo(function(){
+    if(!results)return null;
+    var needs=results.rows.filter(function(r){return r._qtyToBuy>0});
+    return{
+      needOrder:needs.length,
+      totalQty:needs.reduce(function(s,r){return s+r._adjustedOrderQty},0),
+      totalPacks:needs.reduce(function(s,r){return s+r._packsToOrder},0),
+      totalValue:needs.reduce(function(s,r){return s+r._adjustedOrderValue},0),
+    };
+  },[results]);
+
+  const doExport=useCallback(function(){
+    if(!results)return null;
+    var source=onlyOrder?results.rows.filter(function(r){return r._qtyToBuy>0}):results.rows;
+    if(onlyRanked)source=source.filter(function(r){return r._rank!==""&&r._rank<=500});
+    var exportRows=source.map(function(r){
+      var row={};
+      row["Rank"]=r._rank;
+      whCols.forEach(function(c){row[c]=r[c]});
+      row["Min Order Type"]=r._isSingle?"Single PCS":"Medium Package";
+      row["Store Stock"]=r._storeStock;
+      row["Stock Health"]=r._stockHealth;
+      row["Sale Qty 30D"]=r._sale30D;
+      row["Sale Qty 90D"]=r._sale90D;
+      row["Avg Daily Sales"]=r._avgDailySales;
+      row["Days of Cover Left"]=r._daysOfCoverLeft;
+      // Monthly sales
+      if(salesInfo){
+        salesInfo.months.forEach(function(m,i){
+          row[salesInfo.monthLabels[i]+" Sale"]=r._monthlySales[m]||0;
+        });
+        row["Total 6M Sale"]=r._totalSale6m;
+      }
+      row["Qty Needed"]=r._qtyToBuy;
+      row["Target Days (Top500=90D)"]=r._targetDaysUsed;
+      row["Pack Size"]=r._isSingle?1:r._packSize;
+      row["Packs to Order"]=r._isSingle?r._qtyToBuy:r._packsToOrder;
+      row["Final Order Qty"]=r._adjustedOrderQty;
+      row["Order Value (\u20B9)"]=r._adjustedOrderValue;
+      row["Reason"]=r._reason;
+      return row;
+    });
+    var ws=XLSX.utils.json_to_sheet(exportRows);
+    ws["!cols"]=Object.keys(exportRows[0]).map(function(k){return{wch:Math.min(Math.max(k.length+2,10),42)}});
+    var wb=XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb,ws,"Order Plan");
+    XLSX.writeFile(wb,"Order_Plan_"+targetDays+"d_"+new Date().toISOString().slice(0,10)+".xlsx");
+  },[results,whCols,targetDays,onlyOrder,onlyRanked,salesInfo]);
+
+  var cs={
+    card:{background:"#161926",border:"1px solid #1f2539",borderRadius:11},
+    sel:{padding:"7px 10px",borderRadius:7,border:"1px solid #2d3348",background:"#161926",color:"#c9d1e0",fontSize:12.5},
+    mono:{fontFamily:"'JetBrains Mono',monospace"},
+  };
+
+  // Build visible columns dynamically
+  var visibleCols=[
+    {key:"_rank",label:"Rank",w:42,align:"right",added:true,highlight:true},
+    {key:"skuCode",label:"SKU Code",w:100},
+    {key:"skuName",label:"Product Name",w:170},
+    {key:"bigCategory",label:"Category",w:90},
+    {key:"Specification",label:"Spec",w:42},
+    {key:"minOrderSpec",label:"Min Order",w:65},
+    {key:"price",label:"Price",w:50,align:"right"},
+    {key:"stockQty",label:"WH Qty",w:48,align:"right"},
+    {key:"totalStock",label:"WH Status",w:60},
+    {key:"_storeStock",label:"Store Stock",w:60,align:"right",added:true},
+    {key:"_stockHealth",label:"Stock Health",w:110,added:true},
+    {key:"_sale30D",label:"30D",w:36,align:"right",added:true},
+    {key:"_sale90D",label:"90D",w:36,align:"right",added:true},
+    {key:"_avgDailySales",label:"Avg/D",w:42,align:"right",added:true},
+    {key:"_daysOfCoverLeft",label:"Days Left",w:52,align:"right",added:true},
+  ];
+  // Monthly sale columns
+  if(salesInfo){
+    salesInfo.monthLabels.forEach(function(label,i){
+      visibleCols.push({key:"_month_"+i,label:label,w:46,align:"right",added:true,monthly:true});
+    });
+    visibleCols.push({key:"_totalSale6m",label:"6M Total",w:52,align:"right",added:true,highlight:true});
+  }
+  visibleCols.push({key:"_qtyToBuy",label:"Need",w:42,align:"right",added:true});
+  visibleCols.push({key:"_packsToOrder",label:"Packs",w:40,align:"right",added:true,highlight:true});
+  visibleCols.push({key:"_adjustedOrderQty",label:"Order Qty",w:62,align:"right",added:true,highlight:true});
+  visibleCols.push({key:"_reason",label:"Reason",w:220,added:true});
+
+  function getCellVal(r,c){
+    if(c.key==="_rank")return r._rank;
+    if(c.key==="_totalSale6m")return r._totalSale6m;
+    if(c.monthly&&salesInfo){
+      var idx=parseInt(c.key.split("_month_")[1],10);
+      var mo=salesInfo.months[idx];
+      return r._monthlySales[mo]||0;
+    }
+    return r[c.key];
+  }
+
+  function healthColor(val){
+    var s=String(val||"").toLowerCase();
+    if(s.includes("dead"))return{bg:"#1c0a0a",fg:"#f87171"};
+    if(s.includes("under"))return{bg:"#1a1507",fg:"#fbbf24"};
+    if(s.includes("good")||s.includes("healthy"))return{bg:"#071a0e",fg:"#4ade80"};
+    if(s.includes("fast"))return{bg:"#071520",fg:"#38bdf8"};
+    if(s.includes("caution"))return{bg:"#1a1200",fg:"#f59e0b"};
+    if(s.includes("bad"))return{bg:"#1c0a0a",fg:"#f87171"};
+    return{bg:"#161926",fg:"#94a3b8"};
+  }
+
+  return (
+    <div>
+      <div style={{background:"#10121c",borderBottom:"1px solid #1f2539",padding:"16px 24px",display:"flex",alignItems:"center",gap:12}}>
+        <div style={{width:36,height:36,borderRadius:9,background:"linear-gradient(135deg,#2563eb,#7c3aed)",display:"flex",alignItems:"center",justifyContent:"center",fontSize:18}}>📦</div>
+        <div>
+          <h1 style={{margin:0,fontSize:18,fontWeight:700,color:"#f0f2f7",letterSpacing:"-0.02em"}}>Smart Replenishment Planner</h1>
+          <p style={{margin:0,fontSize:11.5,color:"#5d6579"}}>Warehouse + Stock Health + Monthly Sales → Order Plan with Ranking</p>
+        </div>
+      </div>
+
+      <div style={{padding:"20px 24px",maxWidth:1600,margin:"0 auto"}}>
+
+      {step===1&&(
+        <div>
+          {/* 3 Upload Cards */}
+          <div className="upload-grid" style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:14,marginBottom:16}}>
+            {[
+              {done:!!whData,icon:"\uD83C\uDFED",title:"Warehouse Report",desc:"Order Able Manifest \u2014 all columns preserved",name:whName,count:whData?whData.length:0,type:"wh"},
+              {done:!!shData,icon:"\uD83D\uDCCA",title:"Stock Health Export",desc:"Power BI export \u2014 stock, sales, health status",name:shName,count:shData?shData.length:0,type:"sh"},
+              {done:!!salesData,icon:"\uD83D\uDCC5",title:"Monthly Sales Data",desc:"Last 6 months \u2014 Month-Year, Product Code, Qty",name:salesName,count:salesData?salesData.length:0,type:"sales"},
+            ].map(function(f,i){
+              return(
+                <div key={i} style={{background:f.done?"#081210":"#161926",border:f.done?"2px solid #166534":"2px dashed #2d3348",borderRadius:12,padding:20}}>
+                  <div style={{fontSize:26,marginBottom:5}}>{f.icon}</div>
+                  <h3 style={{margin:"0 0 3px",fontSize:14,fontWeight:600,color:"#eef0f5"}}>{f.title}</h3>
+                  <p style={{margin:"0 0 12px",fontSize:11.5,color:"#5d6579"}}>{f.desc}</p>
+                  {f.done?(
+                    <div style={{display:"flex",alignItems:"center",gap:6}}>
+                      <span style={{color:"#22c55e",fontSize:16}}>✓</span>
+                      <span style={{fontSize:12,color:"#6ee7b7"}}>{f.name}</span>
+                      <span style={{fontSize:11,color:"#5d6579",marginLeft:"auto"}}>{f.count} rows</span>
+                    </div>
+                  ):(
+                    <label style={{display:"inline-block",padding:"7px 18px",background:"#1f2539",borderRadius:8,cursor:"pointer",fontSize:12.5,fontWeight:500,color:"#94a3b8",border:"1px solid #2d3348"}}>
+                      Upload File
+                      <input type="file" accept=".xlsx,.xls,.csv" onChange={function(e){if(e.target.files&&e.target.files[0])load(e.target.files[0],f.type)}} />
+                    </label>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+
+          {salesInfo&&(
+            <div style={{...cs.card,padding:"10px 16px",marginBottom:14,fontSize:12,color:"#5d6579"}}>
+              <b style={{color:"#7a8299"}}>Sales data loaded:</b> {salesInfo.monthLabels.join(", ")} — {Object.keys(salesInfo.skuMap).length} unique SKUs — Top 500 ranked
+            </div>
+          )}
+
+          {err&&<div style={{padding:"8px 14px",background:"#2a0f0f",border:"1px solid #7f1d1d",borderRadius:8,color:"#fca5a5",fontSize:12,marginBottom:12}}>{err}</div>}
+
+          <div style={{...cs.card,padding:16,marginBottom:16}}>
+            <div style={{fontSize:12,color:"#7a8299",marginBottom:10,fontWeight:600,textTransform:"uppercase",letterSpacing:"0.04em"}}>⚙️ Target Days of Cover <span style={{fontWeight:400,textTransform:"none",color:"#5d6579"}}>(for non-Top 500 SKUs — Top 500 always use 90 days)</span></div>
+            <div style={{display:"flex",alignItems:"center",gap:8,flexWrap:"wrap"}}>
+              {[15,21,30,45,60].map(function(d){return(
+                <button key={d} onClick={function(){setTargetDays(d)}} style={{
+                  padding:"8px 18px",borderRadius:7,fontSize:13,fontWeight:500,cursor:"pointer",
+                  border:targetDays===d?"1px solid #3b82f6":"1px solid #2d3348",
+                  background:targetDays===d?"#172554":"#1f2539",
+                  color:targetDays===d?"#93c5fd":"#7a8299",
+                }}>{d}d</button>
+              )})}
+              <input type="number" value={targetDays} onChange={function(e){setTargetDays(Math.max(1,Number(e.target.value)||30))}}
+                style={{width:60,padding:"8px",borderRadius:7,border:"1px solid #2d3348",background:"#0c0e16",color:"#d4dae6",fontSize:13,textAlign:"center"}} />
+            </div>
+          </div>
+
+          <button disabled={!whData||!shData} onClick={function(){setStep(2)}} style={{
+            width:"100%",padding:14,borderRadius:10,border:"none",fontSize:16,fontWeight:600,letterSpacing:"-0.01em",
+            cursor:whData&&shData?"pointer":"not-allowed",
+            background:whData&&shData?"linear-gradient(135deg,#2563eb,#7c3aed)":"#1f2539",
+            color:whData&&shData?"#fff":"#3f4760",
+          }}>
+            {whData&&shData?"🔄 Generate Order Plan"+(salesData?"":" (Monthly Sales optional)"):"Upload Warehouse + Stock Health to continue"}
+          </button>
+
+          <div style={{marginTop:16,padding:"14px 18px",...cs.card,fontSize:12,color:"#5d6579",lineHeight:1.8}}>
+            <b style={{color:"#7a8299"}}>What this does:</b><br/>
+            • Preserves all warehouse columns, appends stock health + order calculation<br/>
+            • <span style={{color:"#38bdf8"}}>Monthly Sales</span> — 6 columns showing each month's sale qty per SKU<br/>
+            • <span style={{color:"#fbbf24"}}>Ranking</span> — Top 500 SKUs ranked by total 6-month sales → <b style={{color:"#fbbf24"}}>fixed 90 days cover</b><br/>
+            • <span style={{color:"#7a8299"}}>Non-Top 500</span> — uses your selected target days ({targetDays}D)<br/>
+            • <span style={{color:"#4ade80"}}>Pack logic</span> — <b>Single PCS</b>: buy exact qty | <b>Medium Package</b>: round up to full packs
+          </div>
+        </div>
+      )}
+
+      {step===2&&results&&(
+        <div>
+          <div className="top-bar" style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14}}>
+            <button onClick={function(){setStep(1)}} style={{padding:"7px 16px",borderRadius:7,border:"1px solid #2d3348",background:"#1f2539",color:"#7a8299",fontSize:12.5,cursor:"pointer"}}>← Back</button>
+            <div style={{display:"flex",gap:10,alignItems:"center",flexWrap:"wrap"}}>
+              <label style={{fontSize:12,color:"#7a8299",display:"flex",alignItems:"center",gap:5,cursor:"pointer"}}>
+                <input type="checkbox" checked={onlyOrder} onChange={function(e){setOnlyOrder(e.target.checked)}} />
+                Only items to order
+              </label>
+              <label style={{fontSize:12,color:"#7a8299",display:"flex",alignItems:"center",gap:5,cursor:"pointer"}}>
+                <input type="checkbox" checked={onlyRanked} onChange={function(e){setOnlyRanked(e.target.checked)}} />
+                Only Top 500
+              </label>
+              <button onClick={doExport} style={{padding:"9px 20px",borderRadius:8,border:"none",background:"linear-gradient(135deg,#059669,#10b981)",color:"#fff",fontSize:13,fontWeight:600,cursor:"pointer"}}>
+                📥 Download Excel
+              </button>
+            </div>
+          </div>
+
+          <div className="stats-grid" style={{display:"grid",gridTemplateColumns:"repeat(5,1fr)",gap:10,marginBottom:14}}>
+            {[
+              {label:"Total SKUs",val:results.rows.length,color:"#64748b"},
+              {label:"Matched",val:results.matchCount,color:"#3b82f6"},
+              {label:"Need to Order",val:stats?stats.needOrder:0,color:"#f59e0b"},
+              {label:"Total Packs",val:stats?stats.totalPacks:0,color:"#a78bfa"},
+              {label:"Order Value",val:"\u20B9"+(stats?stats.totalValue:0).toLocaleString(),color:"#10b981"},
+            ].map(function(c,i){return(
+              <div key={i} style={{...cs.card,padding:"12px 14px",borderLeft:"3px solid "+c.color}}>
+                <div style={{fontSize:10,color:"#5d6579",textTransform:"uppercase",letterSpacing:"0.04em"}}>{c.label}</div>
+                <div style={{fontSize:20,fontWeight:700,color:"#eef0f5",...cs.mono}}>{c.val}</div>
+              </div>
+            )})}
+          </div>
+
+          <div style={{...cs.card,padding:"8px 14px",marginBottom:14,display:"flex",gap:10,alignItems:"center"}}>
+            <input placeholder="🔍 Search SKU, name, or stock health..." value={search} onChange={function(e){setSearch(e.target.value)}}
+              style={{padding:"8px 12px",borderRadius:7,border:"1px solid #2d3348",background:"#0c0e16",color:"#d4dae6",fontSize:13,flex:1}} />
+            <span style={{fontSize:11.5,color:"#3f4760"}}>{filtered.length} shown</span>
+          </div>
+
+          <div style={{...cs.card,overflow:"hidden"}}>
+            <div style={{overflowX:"auto"}}>
+              <table style={{width:"100%",borderCollapse:"collapse",fontSize:11}}>
+                <thead>
+                  <tr style={{background:"#121520"}}>
+                    {visibleCols.map(function(c,i){return(
+                      <th key={i} style={{
+                        padding:"8px 4px",textAlign:c.align||"left",
+                        color:c.highlight?"#fbbf24":c.monthly?"#38bdf8":c.added?"#60a5fa":"#7a8299",
+                        fontWeight:600,fontSize:9.5,textTransform:"uppercase",letterSpacing:"0.03em",
+                        borderBottom:"1px solid #1f2539",whiteSpace:"nowrap",width:c.w,
+                        background:c.highlight?"#1a1400":c.monthly?"#0a1520":c.added?"#0c1427":"transparent",
+                      }}>{c.label}</th>
+                    )})}
+                  </tr>
+                </thead>
+                <tbody>
+                  {filtered.slice(0,500).map(function(r,idx){return(
+                    <tr key={idx} style={{borderBottom:"1px solid #1a1d2b",background:idx%2?"#0e1019":"transparent"}}>
+                      {visibleCols.map(function(c,ci){
+                        var val=getCellVal(r,c);
+                        var isQty=c.key==="_adjustedOrderQty";
+                        var isPacks=c.key==="_packsToOrder";
+                        var isNeed=c.key==="_qtyToBuy";
+                        var isDays=c.key==="_daysOfCoverLeft";
+                        var isHealth=c.key==="_stockHealth";
+                        var isReason=c.key==="_reason";
+                        var isRank=c.key==="_rank";
+                        var is6m=c.key==="_totalSale6m";
+
+                        var color="#d4dae6";
+                        if(c.monthly){color=num(val)>0?"#7dd3fc":"#1e293b"}
+                        else if(is6m){color=num(val)>0?"#fbbf24":"#1e293b"}
+                        else if(isRank){color=val?val<=10?"#4ade80":val<=50?"#22d3ee":val<=100?"#a78bfa":val<=500?"#fbbf24":"#3f4760":"#1e293b"}
+                        else if(c.added&&!isHealth&&!isReason&&!isQty&&!isPacks)color="#93c5fd";
+                        if((isQty||isPacks)&&num(val)>0)color="#4ade80";
+                        if((isQty||isPacks||isNeed)&&num(val)<=0)color="#3f4760";
+                        if(isNeed&&num(val)>0)color="#93c5fd";
+                        if(isDays){var d2=num(val);color=val==="No Sales"?"#3f4760":d2<=5?"#ef4444":d2<=10?"#f59e0b":d2<=20?"#eab308":"#22c55e"}
+                        if(!r._matched&&c.added&&!isRank&&!c.monthly&&!is6m)color="#2d3348";
+
+                        var tdStyle={
+                          padding:"6px 4px",textAlign:c.align||"left",color:color,
+                          background:c.highlight?"#0d0c05":c.monthly?"#060d14":c.added?"#0a0f1d":"transparent",
+                          maxWidth:c.w,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap",
+                        };
+                        if(isQty||isPacks||isRank){tdStyle.fontWeight=700;tdStyle.fontSize=12;tdStyle.fontFamily="'JetBrains Mono',monospace"}
+                        else if(c.align==="right"){tdStyle.fontFamily="'JetBrains Mono',monospace";tdStyle.fontSize=11}
+
+                        return(
+                          <td key={ci} style={tdStyle} title={isReason||isHealth?String(val||""):undefined}>
+                            {isHealth&&val?(
+                              <span style={{display:"inline-block",padding:"2px 6px",borderRadius:4,fontSize:9.5,background:healthColor(val).bg,color:healthColor(val).fg}}>{val}</span>
+                            ):isReason?(
+                              <span style={{fontSize:10,color:"#7a8299"}}>{val||""}</span>
+                            ):isRank&&val?(
+                              <span style={{display:"inline-block",padding:"1px 5px",borderRadius:3,fontSize:10,fontWeight:700,background:val<=10?"#052e16":val<=50?"#082f49":val<=100?"#1e1b4b":"#1a1400",color:color}}>#{val}</span>
+                            ):(
+                              String(val!=null?val:"")
+                            )}
+                          </td>
+                        );
+                      })}
+                    </tr>
+                  )})}
+                </tbody>
+              </table>
+            </div>
+            {filtered.length>500&&(<div style={{padding:"10px",textAlign:"center",color:"#3f4760",fontSize:12,borderTop:"1px solid #1f2539"}}>Showing 500 of {filtered.length} — download Excel for complete data</div>)}
+            {filtered.length===0&&(<div style={{padding:"40px",textAlign:"center",color:"#3f4760"}}>No matching SKUs. Adjust filters.</div>)}
+          </div>
+
+          <div style={{marginTop:14,padding:"12px 16px",...cs.card,fontSize:11,color:"#5d6579",lineHeight:1.7}}>
+            <b style={{color:"#7a8299"}}>Logic:</b>&nbsp;
+            <b style={{color:"#fbbf24"}}>Top 500 SKUs</b>: fixed <b style={{color:"#fbbf24"}}>90 days</b> cover
+            &nbsp;·&nbsp;<b style={{color:"#7a8299"}}>Others</b>: {targetDays} days cover
+            &nbsp;·&nbsp;Order Qty = (Avg Daily Sales × Days) − Store Stock
+            &nbsp;·&nbsp;<b style={{color:"#4ade80"}}>Single PCS</b>: exact qty | <b style={{color:"#4ade80"}}>Medium Pkg</b>: round up to packs
+            {salesInfo&&(" · Months: "+salesInfo.monthLabels.join(", "))}
+          </div>
+        </div>
+      )}
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+</script>
+</body>
+</html>
