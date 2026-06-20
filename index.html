@@ -120,7 +120,7 @@ function App(){
     var monthSet=new Set();
     salesData.forEach(function(r){monthSet.add(String(r["Month-Year"]||""))});
     var allMonths=Array.from(monthSet).sort();
-    var last6=allMonths.slice(-7);
+    var last6=allMonths.slice(-6);
 
     // Build per-SKU monthly qty map and totals
     var skuMap={};
